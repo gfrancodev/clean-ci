@@ -1,0 +1,167 @@
+name: Develop Pipeline
+
+setup: 
+  root:
+    node_version: &node_version 22.6.0
+    checkout_action: &checkout_action actions/checkout@v3
+    setup_node_action: &setup_node_action actions/setup-node@v3
+    ubuntu_latest: &ubuntu_latest ubuntu-latest
+
+  docker:
+    username: &docker_username ${{ secrets.DOCKER_USERNAME }}
+    password: &docker_password ${{ secrets.DOCKER_PASSWORD }}
+    host: &dockerhub_host docker.io
+    image_name: &image_name gfrancodev/{{ env.IMAGE_NAME }}
+    image_tag_commit: &image_tag_commit gfrancodev/{{ env.IMAGE_NAME }}:${{ github.sha }}
+    image_tag_latest: &image_tag_latest gfrancodev/{{ env.IMAGE_NAME }}:latest
+    dockerfile: &docker_file_path ./backend/Dockerfile
+    login: &docker_login
+      uses: docker/login-action@v2
+      with:
+        username: *docker_username
+        password: *docker_password
+
+  sonar: 
+    version: &sonar_version sonarsource/sonarqube-scan-action@v1.5.0
+    args: &sonar_args |
+      -Dsonar.projectKey=your_project_key
+      -Dsonar.organization=your_organization
+      -Dsonar.sources=./backend
+      -Dsonar.host.url=https://sonarcloud.io
+      -Dsonar.login=${{ secrets.SONAR_TOKEN }}
+
+  security:
+    dependencies: &security_deps |
+        wget=1.20.3-1ubuntu1
+        apt-transport-https=1.8.2.2
+        gnupg=2.2.19-3ubuntu2
+        lsb-release=11.1.0ubuntu2
+
+env:
+  DOCKERHUB_HOST: *dockerhub_host
+  IMAGE_NAME: *image_name
+  IMAGE_TAG_COMMIG: *image_tag_commit
+  IMAGE_TAG_LATEST: *image_tag_commit
+  COMMIT_ID: ${{ github.sha }}
+  SECURITY_DEPS: *security_deps
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the code
+        uses: *checkout_action
+
+      - name: Set up Node.js
+        uses: *setup_node_action
+        with:
+          node-version: *node_version
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run ESLint
+        run: npm run lint
+
+  test:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: Check out the code
+        uses: *checkout_action
+
+      - name: Set up Node.js
+        uses: *setup_node_action
+        with:
+          node-version: *node_version
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run unit tests
+        run: npm run test
+
+      - name: Run integration tests
+        run: npm run test:integration
+
+  sonar:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Check out the code
+        uses: *checkout_action
+
+      - name: Setup SonarQube
+        uses: *sonar_version
+        with:
+          args: *sonar_args
+
+  build:
+    runs-on: ubuntu-latest
+    needs: sonar
+    steps:
+      - name: Check out the code
+        uses: *checkout_action
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: *docker_file_path
+          push: false
+          tags: |
+            ${{ env.IMAGE_TAG_COMMIT }}
+
+      - name: Save Docker image
+        run: |
+          docker save ${{ env.IMAGE_TAG_COMMIT }} -o image.tar
+
+  security:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Set up Trivy
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends ${SECURITY_DEPS}
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install -y trivy
+
+      - name: Load Docker image
+        run: |
+          docker load -i image.tar
+
+      - name: Scan Docker image with Trivy
+        run: trivy image --no-progress --exit-code 1 --severity HIGH,CRITICAL ${{ env.IMAGE_TAG_COMMIT }}
+
+  push:
+    runs-on: ubuntu-latest 
+    needs: security
+    steps:
+      - name: Log in to Docker Hub
+        <<: *docker_login
+
+      - name: Load Docker image
+        run: |
+          docker load -i image.tar 
+
+      - name: Tag Docker image
+        run: |
+          docker tag ${{ env.IMAGE_TAG_COMMIT }} ${{ env.IMAGE_TAG_COMMIT }}
+          docker tag ${{ env.IMAGE_TAG_COMMIT }} ${{ env.IMAGE_TAG_LATEST }}
+
+      - name: Push Docker 
+        run: |
+          docker push ${{ env.IMAGE_TAG_COMMIT }}
+          docker push ${{ env.IMAGE_TAG_LATEST }}
